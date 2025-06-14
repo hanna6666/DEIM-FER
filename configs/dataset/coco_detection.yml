@@ -4,15 +4,15 @@ evaluator:
   type: CocoEvaluator
   iou_types: ['bbox', ]
 
-num_classes: 80
+num_classes: 7
 remap_mscoco_category: True
 
 train_dataloader: 
   type: DataLoader
   dataset: 
     type: CocoDetection
-    img_folder: /datassd/COCO/train2017/
-    ann_file: /datassd/COCO/annotations/instances_train2017.json
+    img_folder: /home/hanna/桌面/rafdb_basic./Image/original
+    ann_file: /home/hanna/桌面/DEIM/rafdb_train_coco.json
     return_masks: False
     transforms:
       type: Compose
@@ -28,8 +28,8 @@ val_dataloader:
   type: DataLoader
   dataset: 
     type: CocoDetection
-    img_folder: /datassd/COCO/val2017/
-    ann_file: /datassd/COCO/annotations/instances_val2017.json
+    img_folder: /home/hanna/桌面/rafdb_basic./Image/original
+    ann_file: /home/hanna/桌面/DEIM/rafdb_val_coco.json
     return_masks: False
     transforms:
       type: Compose
