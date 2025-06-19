@@ -16,6 +16,7 @@ from ..misc import dist_utils, stats
 
 from ._solver import BaseSolver
 from .det_engine import train_one_epoch, evaluate
+import os
 from ..optim.lr_scheduler import FlatCosineLRScheduler
 
 
@@ -24,6 +25,9 @@ class DetSolver(BaseSolver):
     def fit(self, ):
         self.train()
         args = self.cfg
+        # from engine.hook import register_encoder_attn_hooks
+        # model = self.model.module if hasattr(self.model, 'module') else self.model
+        # register_encoder_attn_hooks(model.encoder) 
 
         n_parameters, model_stats = stats(self.cfg)
         print(model_stats)
@@ -44,13 +48,24 @@ class DetSolver(BaseSolver):
         # evaluate again before resume training
         if self.last_epoch > 0:
             module = self.ema.module if self.ema else self.model
+            # test_stats, coco_evaluator = evaluate(
+            #     module,
+            #     self.criterion,
+            #     self.postprocessor,
+            #     self.val_dataloader,
+            #     self.evaluator,
+            #     self.device
+            # )
+            log_file = os.path.join(self.output_dir, "coco_ap_log.json")
             test_stats, coco_evaluator = evaluate(
                 module,
                 self.criterion,
                 self.postprocessor,
                 self.val_dataloader,
                 self.evaluator,
-                self.device
+                self.device,
+                epoch=epoch,  # ✅ 传入当前 epoch
+                log_file=log_file
             )
             for k in test_stats:
                 best_stat['epoch'] = self.last_epoch
@@ -105,13 +120,25 @@ class DetSolver(BaseSolver):
                     dist_utils.save_on_master(self.state_dict(), checkpoint_path)
 
             module = self.ema.module if self.ema else self.model
+            # test_stats, coco_evaluator = evaluate(
+            #     module,
+            #     self.criterion,
+            #     self.postprocessor,
+            #     self.val_dataloader,
+            #     self.evaluator,
+            #     self.device
+            # )
+            log_file = os.path.join(self.output_dir, "coco_ap_log.json")
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
             test_stats, coco_evaluator = evaluate(
                 module,
                 self.criterion,
                 self.postprocessor,
                 self.val_dataloader,
                 self.evaluator,
-                self.device
+                self.device,
+                epoch=epoch,  # ✅ 传入当前 epoch
+                log_file=log_file
             )
 
             # TODO

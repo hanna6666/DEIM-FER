@@ -19,6 +19,9 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
+from engine.hook import attn_maps 
+import os
+import json
 
 
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
@@ -65,6 +68,15 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 loss_dict = criterion(outputs, targets, **metas)
 
             loss = sum(loss_dict.values())
+
+
+            # 示例：获取第 0 层 encoder 的 QK attention
+            # print(attn_maps)
+            # attn_map = attn_maps['encoder_layer0']['attn']  # shape: [B, H, N, N]
+
+            # # 你可以构造一个 loss，加入到 loss_dict 里
+            # loss_attn = compute_supervised_attention_loss(attn_map, gt_attention_map)
+            # loss_dict['loss_attn_supervise'] = loss_attn * weight
             scaler.scale(loss).backward()
 
             if max_norm > 0:
@@ -123,7 +135,61 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, data_loader, coco_evaluator: CocoEvaluator, device):
+# def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, data_loader, coco_evaluator: CocoEvaluator, device):
+#     model.eval()
+#     criterion.eval()
+#     coco_evaluator.cleanup()
+
+#     metric_logger = MetricLogger(delimiter="  ")
+#     # metric_logger.add_meter('class_error', SmoothedValue(window_size=1, fmt='{value:.2f}'))
+#     header = 'Test:'
+
+#     # iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessor.keys())
+#     iou_types = coco_evaluator.iou_types
+#     # coco_evaluator = CocoEvaluator(base_ds, iou_types)
+#     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
+
+#     for samples, targets in metric_logger.log_every(data_loader, 10, header):
+#         samples = samples.to(device)
+#         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+#         outputs = model(samples)
+
+#         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+
+#         results = postprocessor(outputs, orig_target_sizes)
+
+#         # if 'segm' in postprocessor.keys():
+#         #     target_sizes = torch.stack([t["size"] for t in targets], dim=0)
+#         #     results = postprocessor['segm'](results, outputs, orig_target_sizes, target_sizes)
+
+#         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+#         if coco_evaluator is not None:
+#             coco_evaluator.update(res)
+
+#     # gather the stats from all processes
+#     metric_logger.synchronize_between_processes()
+#     print("Averaged stats:", metric_logger)
+#     if coco_evaluator is not None:
+#         coco_evaluator.synchronize_between_processes()
+
+#     # accumulate predictions from all images
+#     if coco_evaluator is not None:
+#         coco_evaluator.accumulate()
+#         coco_evaluator.summarize()
+
+#     stats = {}
+#     # stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+#     if coco_evaluator is not None:
+#         if 'bbox' in iou_types:
+#             stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
+#         if 'segm' in iou_types:
+#             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
+
+#     return stats, coco_evaluator
+
+def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, data_loader,
+             coco_evaluator: CocoEvaluator, device, epoch: int = None, log_file: str = "logs/coco_ap_log.json"):
     model.eval()
     criterion.eval()
     coco_evaluator.cleanup()
@@ -173,5 +239,23 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
             stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
         if 'segm' in iou_types:
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
+
+    # ✅ 记录到 json 文件（每个 epoch 一条记录）
+    if epoch is not None:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        log_data = {"epoch": epoch}
+        log_data.update(stats)
+        if os.path.exists(log_file):
+            with open(log_file, "r+", encoding="utf-8") as f:
+                try:
+                    logs = json.load(f)
+                except json.JSONDecodeError:
+                    logs = []
+                logs.append(log_data)
+                f.seek(0)
+                json.dump(logs, f, indent=4)
+        else:
+            with open(log_file, "w", encoding="utf-8") as f:
+                json.dump([log_data], f, indent=4)
 
     return stats, coco_evaluator
