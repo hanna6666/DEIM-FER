@@ -38,6 +38,98 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = self.act(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
+    
+class VectorQuantizer(nn.Module):
+    """
+    see https://github.com/MishaLaskin/vqvae/blob/d761a999e2267766400dc646d82d3ac3657771d4/models/quantizer.py
+    ____________________________________________
+    Discretization bottleneck part of the VQ-VAE.
+    Inputs:
+    - n_e : number of embeddings
+    - e_dim : dimension of embedding
+    - beta : commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
+    _____________________________________________
+    """
+
+    # NOTE: this class contains a bug regarding beta; see VectorQuantizer2 for
+    # a fix and use legacy=False to apply that fix. VectorQuantizer2 can be
+    # used wherever VectorQuantizer has been used before and is additionally
+    # more efficient.
+    def __init__(self, n_e, e_dim, beta):
+        super(VectorQuantizer, self).__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        self.beta = beta
+
+        self.embedding = nn.Embedding(self.n_e, self.e_dim)
+        self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
+
+    def compute_attention(self, z):
+        B, C, H, W = z.shape
+        z = z.permute(0, 2, 3, 1).contiguous()   # (B, H, W, C)
+        z_flat = z.view(-1, self.e_dim)         # (BHW, C)
+        emb = self.embedding.weight             # (N, C)
+        attn = torch.matmul(F.normalize(z_flat, dim=1), F.normalize(emb.t(), dim=0))  # cosine similarity
+        attn = attn.view(B, H, W, self.n_e)  # (B, H, W, N)
+        return attn
+
+    def forward(self, z):
+        """
+        Inputs the output of the encoder network z and maps it to a discrete
+        one-hot vector that is the index of the closest embedding vector e_j
+        z (continuous) -> z_q (discrete)
+        z.shape = (batch, channel, height, width)
+        quantization pipeline:
+            1. get encoder input (B,C,H,W)
+            2. flatten input to (B*H*W,C)
+        """
+        # reshape z -> (batch, height, width, channel) and flatten
+        z = z.permute(0, 2, 3, 1).contiguous()
+        z_flattened = z.view(-1, self.e_dim)
+        # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
+
+        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
+            torch.sum(self.embedding.weight**2, dim=1) - 2 * \
+            torch.matmul(z_flattened, self.embedding.weight.t())
+
+        ## could possible replace this here
+        # #\start...
+        # find closest encodings
+        min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
+
+        min_encodings = torch.zeros(
+            min_encoding_indices.shape[0], self.n_e).to(z)
+        min_encodings.scatter_(1, min_encoding_indices, 1)
+
+        # dtype min encodings: torch.float32
+        # min_encodings shape: torch.Size([2048, 512])
+        # min_encoding_indices.shape: torch.Size([2048, 1])
+
+        # get quantized latent vectors
+        z_q = torch.matmul(min_encodings, self.embedding.weight).view(z.shape)
+        #.........\end
+
+        # with:
+        # .........\start
+        #min_encoding_indices = torch.argmin(d, dim=1)
+        #z_q = self.embedding(min_encoding_indices)
+        # ......\end......... (TODO)
+
+        # compute loss for embedding
+        loss = torch.mean((z_q.detach()-z)**2) + self.beta * \
+            torch.mean((z_q - z.detach()) ** 2)
+
+        # preserve gradients
+        z_q = z + (z_q - z).detach()
+
+        # perplexity
+        e_mean = torch.mean(min_encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
+
+        # reshape back to match original input shape
+        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+
+        return z_q, loss, (perplexity, min_encodings, min_encoding_indices)
 
 
 class MSDeformableAttention(nn.Module):
@@ -331,6 +423,7 @@ class TransformerDecoder(nn.Module):
                 spatial_shapes,
                 bbox_head,
                 score_head,
+                keypoint_head,
                 query_pos_head,
                 pre_bbox_head,
                 integral,
@@ -347,6 +440,7 @@ class TransformerDecoder(nn.Module):
         dec_out_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
+        dec_out_keypoints = []
         if not hasattr(self, 'project'):
             project = weighting_function(self.reg_max, up, reg_scale)
         else:
@@ -373,6 +467,8 @@ class TransformerDecoder(nn.Module):
                 pre_scores = score_head[0](output)
                 ref_points_initial = pre_bboxes.detach()
 
+                pre_keypoints = keypoint_head[0](output)
+
             # Refine bounding box corners using FDR, integrating previous layer's corrections
             pred_corners = bbox_head[i](output + output_detach) + pred_corners_undetach
             inter_ref_bbox = distance2bbox(ref_points_initial, integral(pred_corners, project), reg_scale)
@@ -386,6 +482,9 @@ class TransformerDecoder(nn.Module):
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
 
+                keypoints = keypoint_head[i](output)  # [B, num_queries, num_keypoints * 2]
+                dec_out_keypoints.append(keypoints)
+
                 if not self.training:
                     break
 
@@ -394,7 +493,7 @@ class TransformerDecoder(nn.Module):
             output_detach = output.detach()
 
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores, torch.stack(dec_out_keypoints),pre_keypoints
 
 
 @register()
@@ -428,6 +527,7 @@ class DFINETransformer(nn.Module):
                  reg_scale=4.,
                  layer_scale=1,
                  mlp_act='relu',
+                 num_keypoint = 37,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -442,12 +542,14 @@ class DFINETransformer(nn.Module):
         self.feat_strides = feat_strides
         self.num_levels = num_levels
         self.num_classes = num_classes
+        self.num_keypoint = num_keypoint
         self.num_queries = num_queries
         self.eps = eps
         self.num_layers = num_layers
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
+        self.vq = VectorQuantizer(n_e=128, e_dim=256, beta=0.25)
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -501,6 +603,10 @@ class DFINETransformer(nn.Module):
         self.dec_score_head = nn.ModuleList(
             [nn.Linear(hidden_dim, num_classes) for _ in range(self.eval_idx + 1)]
           + [nn.Linear(scaled_dim, num_classes) for _ in range(num_layers - self.eval_idx - 1)])
+        self.dec_keypoint_head = nn.ModuleList(
+            [nn.Linear(hidden_dim, num_keypoint * 2) for _ in range(self.eval_idx + 1)] +
+            [nn.Linear(scaled_dim, num_keypoint * 2) for _ in range(self.num_layers - self.eval_idx - 1)]
+        )
         self.pre_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act)
         self.dec_bbox_head = nn.ModuleList(
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
@@ -524,6 +630,9 @@ class DFINETransformer(nn.Module):
         self.dec_bbox_head = nn.ModuleList(
             [self.dec_bbox_head[i] if i <= self.eval_idx else nn.Identity() for i in range(len(self.dec_bbox_head))]
         )
+        self.dec_keypoint_head = nn.ModuleList(
+            [nn.Identity()] * (self.eval_idx) + [self.dec_keypoint_head[self.eval_idx]]
+        )
 
     def _reset_parameters(self, feat_channels):
         bias = bias_init_with_prob(0.01)
@@ -539,6 +648,12 @@ class DFINETransformer(nn.Module):
             if hasattr(reg_, 'layers'):
                 init.constant_(reg_.layers[-1].weight, 0)
                 init.constant_(reg_.layers[-1].bias, 0)
+
+        for kpt_ in self.dec_keypoint_head:
+            if hasattr(kpt_, 'weight'):
+                init.constant_(kpt_.weight, 0)
+            if hasattr(kpt_, 'bias'):
+                init.constant_(kpt_.bias, 0)
 
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
@@ -599,7 +714,8 @@ class DFINETransformer(nn.Module):
 
         # [b, l, c]
         feat_flatten = torch.concat(feat_flatten, 1)
-        return feat_flatten, spatial_shapes
+        supervised_feat = proj_feats[1]
+        return feat_flatten, spatial_shapes,supervised_feat
 
     def _generate_anchors(self,
                           spatial_shapes=None,
@@ -702,9 +818,10 @@ class DFINETransformer(nn.Module):
 
         return topk_memory, topk_logits, topk_anchors
 
-    def forward(self, feats, targets=None):
+    def forward(self, feats, key_feats,targets=None):
         # input projection and embedding
-        memory, spatial_shapes = self._get_encoder_input(feats)
+        memory, spatial_shapes,supervised_feat = self._get_encoder_input(feats)
+
 
         # prepare denoising training
         if self.training and self.num_denoising > 0:
@@ -724,13 +841,14 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, out_keypoints,pre_keypoints = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
             spatial_shapes,
             self.dec_bbox_head,
             self.dec_score_head,
+            self.dec_keypoint_head,
             self.query_pos_head,
             self.pre_bbox_head,
             self.integral,
@@ -743,6 +861,7 @@ class DFINETransformer(nn.Module):
             # the output from the first decoder layer, only one
             dn_pre_logits, pre_logits = torch.split(pre_logits, dn_meta['dn_num_split'], dim=1)
             dn_pre_bboxes, pre_bboxes = torch.split(pre_bboxes, dn_meta['dn_num_split'], dim=1)
+            dn_pre_keypoints, pre_keypoints = torch.split(pre_keypoints, dn_meta['dn_num_split'], dim=1)
 
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
@@ -750,27 +869,29 @@ class DFINETransformer(nn.Module):
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
 
+            dn_out_keypoints, out_keypoints = torch.split(out_keypoints, dn_meta['dn_num_split'], dim=2)
+
 
         if self.training:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
-                   'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
+                   'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale,'pred_keypoints': out_keypoints[-1]}
         else:
-            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1],'pred_keypoints': out_keypoints[-1]}
 
         if self.training and self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
+            out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],out_keypoints[:-1],
                                                      out_corners[-1], out_logits[-1])
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
-            out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
+            out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes, 'pre_keypoints': pre_keypoints}
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
             if dn_meta is not None:
-                out['dn_outputs'] = self._set_aux_loss2(dn_out_logits, dn_out_bboxes, dn_out_corners, dn_out_refs,
+                out['dn_outputs'] = self._set_aux_loss2(dn_out_logits, dn_out_bboxes, dn_out_corners, dn_out_refs, dn_out_keypoints,
                                                         dn_out_corners[-1], dn_out_logits[-1])
-                out['dn_pre_outputs'] = {'pred_logits': dn_pre_logits, 'pred_boxes': dn_pre_bboxes}
+                out['dn_pre_outputs'] = {'pred_logits': dn_pre_logits, 'pred_boxes': dn_pre_bboxes, 'pred_keypoints': dn_pre_keypoints}
                 out['dn_meta'] = dn_meta
 
-        return out
+        return out,supervised_feat
 
 
     @torch.jit.unused
@@ -782,11 +903,11 @@ class DFINETransformer(nn.Module):
 
 
     @torch.jit.unused
-    def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,
+    def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref, out_keypoint,
                        teacher_corners=None, teacher_logits=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d,
+        return [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d,'out_keypoints': e,
                      'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}
-                for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)]
+                for a, b, c, d, e in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref,out_keypoint)]
