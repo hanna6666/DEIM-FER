@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from .utils import get_activation
 
 from ..core import register
+from einops import rearrange
 
 __all__ = ['HybridEncoder']
 
@@ -280,6 +281,215 @@ class TransformerEncoder(nn.Module):
         return output
 
 
+class ResDWConv(nn.Conv2d):
+    '''
+    Depthwise convolution with residual connection
+    '''
+    def __init__(self, dim, kernel_size=3):
+        super().__init__(dim, dim, kernel_size=kernel_size, padding=kernel_size//2, groups=dim)
+    
+    def forward(self, x):
+        x = x + super().forward(x)
+        return x
+
+class TransformerCrossEncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu"):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout, batch_first=True)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = get_activation(activation)
+
+    def forward(self,
+                query, key, value,
+                pos_embed=None, query_pos_embed=None,
+                attn_mask=None):
+        q = query if query_pos_embed is None else query + query_pos_embed
+        k = key if pos_embed is None else key + pos_embed
+
+        # Cross-attention
+        attn_output, _ = self.self_attn(q, k, value, attn_mask=attn_mask)
+        query = query + self.dropout1(attn_output)
+        query = self.norm1(query)
+
+        ff = self.linear2(self.dropout(self.activation(self.linear1(query))))
+        query = query + self.dropout2(ff)
+        query = self.norm2(query)
+        return query
+
+class TransformerCrossEncoder(nn.Module):
+    def __init__(self, encoder_layer, num_layers, norm=None):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            copy.deepcopy(encoder_layer) for _ in range(num_layers)
+        ])
+        self.norm = norm
+
+    def forward(self,
+                query,                # [B, Q, C]
+                key_value,            # [B, S, C]
+                pos_embed=None,       # positional embedding for key/value
+                query_pos_embed=None, # positional embedding for query
+                attn_mask=None):
+        output = query
+        for layer in self.layers:
+            output = layer(
+                query=output,
+                key=key_value,
+                value=key_value,
+                pos_embed=pos_embed,
+                query_pos_embed=query_pos_embed,
+                attn_mask=attn_mask
+            )
+        if self.norm is not None:
+            output = self.norm(output)
+        return output    
+
+class BidirectionalCrossEncoder(nn.Module):
+    def __init__(self, encoder_layer, num_layers):
+        super().__init__()
+        self.kpt_to_face = TransformerCrossEncoder(encoder_layer, num_layers)
+        self.face_to_kpt = TransformerCrossEncoder(encoder_layer, num_layers)
+
+    def forward(self,
+                face_feats, kpt_feats,
+                pos_face=None, pos_kpt=None,
+                attn_mask=None):
+        """
+        face_feats: [B, S, C]
+        kpt_feats: [B, Q, C]
+        pos_face:  [B, S, C]
+        pos_kpt:   [B, Q, C]
+        """
+        # 1. keypoint ← face
+        kpt_updated = self.face_to_kpt(
+            query=kpt_feats,
+            key_value=face_feats,
+            pos_embed=pos_face,
+            query_pos_embed=pos_kpt,
+            attn_mask=attn_mask
+        )
+        # 2. face ← keypoint
+        face_updated = self.kpt_to_face(
+            query=face_feats,
+            key_value=kpt_feats,  # 用更新后的 keypoint 特征
+            pos_embed=pos_kpt,
+            query_pos_embed=pos_face,
+            attn_mask=attn_mask
+        )
+        return face_updated, kpt_updated
+
+
+
+class LayerWiseSEFusion(nn.Module):
+    def __init__(self, in_channels_list):
+        super().__init__()
+        total_c = sum(in_channels_list)
+        self.fc = nn.Sequential(
+            nn.Linear(total_c, total_c // 4),
+            nn.ReLU(),
+            nn.Linear(total_c // 4, len(in_channels_list))  # 输出每层的权重
+        )
+
+    def forward(self, features):  # features: List of [B, C, H, W]
+        # Step 1: GAP
+        gaps = [F.adaptive_avg_pool2d(f, 1) for f in features]  # [B, C_i, 1, 1]
+        token = torch.cat(gaps, dim=1)                          # [B, total_c, 1, 1]
+        token_flat = token.view(token.size(0), -1)              # [B, total_c]
+
+        # Step 2: FC to get weights
+        weights = self.fc(token_flat)                           # [B, N]
+        norm_weights = F.softmax(weights, dim=1)                # normalize over layers
+
+        # Step 3: Weighted features
+        out = [feat * norm_weights[:, i].view(-1, 1, 1, 1)for i, feat in enumerate(features)]
+        return out
+    
+class VQSoftmax(nn.Module):
+    """
+    Soft Vector Quantizer using cosine or L2 similarity + softmax attention.
+
+    Args:
+        n_e (int): number of codebook embeddings
+        e_dim (int): embedding dimension
+        beta (float): commitment loss coefficient
+        temperature (float): softmax temperature (lower = more peaked)
+        normalize (bool): whether to use cosine similarity (True) or L2 (False)
+    """
+    def __init__(self, n_e, e_dim, beta=0.25, temperature=1.0, normalize=False):
+        super(VQSoftmax, self).__init__()
+        self.n_e = n_e
+        self.e_dim = e_dim
+        self.beta = beta
+        self.temperature = temperature
+        self.normalize = normalize
+
+        self.embedding = nn.Embedding(n_e, e_dim)
+        self.embedding.weight.data.uniform_(-1.0 / n_e, 1.0 / n_e)
+
+    def forward(self, z):
+        """
+        Args:
+            z: Input tensor of shape (B, C, H, W)
+        Returns:
+            z_q: Quantized output (B, C, H, W)
+            loss: VQ loss (commitment + codebook)
+            extra: tuple(perplexity, attention_weights)
+        """
+        B, C, H, W = z.shape
+        z = z.permute(0, 2, 3, 1).contiguous()               # (B, H, W, C)
+        z_flat = z.view(-1, self.e_dim)                      # (BHW, C)
+        emb = self.embedding.weight                          # (N, C)
+
+        if self.normalize:
+            # Cosine similarity
+            z_flat = F.normalize(z_flat, dim=1)
+            emb = F.normalize(emb, dim=1)
+            logits = torch.matmul(z_flat, emb.t())           # (BHW, N)
+        else:
+            # Negative L2 distance
+            z_sq = torch.sum(z_flat ** 2, dim=1, keepdim=True)     # (BHW, 1)
+            e_sq = torch.sum(emb ** 2, dim=1)                       # (N,)
+            ze = torch.matmul(z_flat, emb.t())                     # (BHW, N)
+            logits = - (z_sq + e_sq - 2 * ze)                       # (BHW, N)
+
+        # Softmax attention over codebook
+        attn = F.softmax(logits / self.temperature, dim=1)         # (BHW, N)
+        z_q = torch.matmul(attn, emb).view(B, H, W, C)             # (B, H, W, C)
+
+        # Compute VQ Loss
+        loss = torch.mean((z_q.detach() - z) ** 2) + \
+               self.beta * torch.mean((z_q - z.detach()) ** 2)
+
+        # Preserve gradients
+        z_q = z + (z_q - z).detach()
+
+        # Compute perplexity
+        avg_probs = torch.mean(attn, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        # Reshape to (B, C, H, W)
+        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+
+        return z_q, loss, (perplexity, attn)
+
+class LayerNorm2d(nn.LayerNorm):
+    def __init__(self, dim):
+        super().__init__(normalized_shape=dim, eps=1e-6)
+    
+    def forward(self, x):
+        x = rearrange(x, 'b c h w -> b h w c')
+        x = super().forward(x)
+        x = rearrange(x, 'b h w c -> b c h w')
+        return x.contiguous()
+
 @register()
 class HybridEncoder(nn.Module):
     __share__ = ['eval_spatial_size', ]
@@ -300,6 +510,9 @@ class HybridEncoder(nn.Module):
                  act='silu',
                  eval_spatial_size=None,
                  version='dfine',
+                 use_gemm=False,
+                 deploy=False,
+                 kernel_size = 7,
                  ):
         super().__init__()
         self.in_channels = in_channels
@@ -335,6 +548,10 @@ class HybridEncoder(nn.Module):
             TransformerEncoder(copy.deepcopy(encoder_layer), num_encoder_layers) for _ in range(len(use_encoder_idx))
         ])
 
+        self.keypoint_encoder = nn.ModuleList([
+            TransformerEncoder(copy.deepcopy(encoder_layer), num_encoder_layers) for _ in range(len(use_encoder_idx))
+        ])
+
         # top-down fpn
         self.lateral_convs = nn.ModuleList()
         self.fpn_blocks = nn.ModuleList()
@@ -361,6 +578,44 @@ class HybridEncoder(nn.Module):
                 RepNCSPELAN4(hidden_dim * 2, hidden_dim, hidden_dim * 2, round(expansion * hidden_dim // 2), round(3 * depth_mult), act=act) \
                 if version == 'dfine' else CSPLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion, bottletype=VGGBlock)
             )
+
+        self.key_lateral_convs = nn.ModuleList()
+        self.key_fpn_blocks = nn.ModuleList()
+        for _ in range(len(in_channels) - 1, 0, -1):
+            # TODO, add activation for those lateral convs
+            if version == 'dfine':
+                self.key_lateral_convs.append(ConvNormLayer_fuse(hidden_dim, hidden_dim, 1, 1))
+            else:
+                self.key_lateral_convs.append(ConvNormLayer_fuse(hidden_dim, hidden_dim, 1, 1, act=act))
+            self.key_fpn_blocks.append(
+                RepNCSPELAN4(hidden_dim * 2, hidden_dim, hidden_dim * 2, round(expansion * hidden_dim // 2), round(3 * depth_mult), act=act) \
+                if version == 'dfine' else CSPLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion, bottletype=VGGBlock)
+            )
+
+        # bottom-up pan
+        self.key_downsample_convs = nn.ModuleList()
+        self.key_pan_blocks = nn.ModuleList()
+        for _ in range(len(in_channels) - 1):
+            self.key_downsample_convs.append(
+                nn.Sequential(SCDown(hidden_dim, hidden_dim, 3, 2, act=act)) \
+                if version == 'dfine' else ConvNormLayer_fuse(hidden_dim, hidden_dim, 3, 2, act=act)
+            )
+            self.key_pan_blocks.append(
+                RepNCSPELAN4(hidden_dim * 2, hidden_dim, hidden_dim * 2, round(expansion * hidden_dim // 2), round(3 * depth_mult), act=act) \
+                if version == 'dfine' else CSPLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion, bottletype=VGGBlock)
+            )
+
+        cross_encoder_layer = TransformerCrossEncoderLayer(d_model=hidden_dim, nhead=8)
+
+        self.cross_feature_attention = BidirectionalCrossEncoder(
+            encoder_layer=cross_encoder_layer,
+            num_layers=num_encoder_layers
+        )
+        # self.vq_softmax = VQSoftmax(n_e=128, e_dim=256, beta=0.25)
+        self.dwconv1 = ResDWConv(2*hidden_dim , kernel_size=3)
+        self.norm1 = LayerNorm2d(2*hidden_dim)
+
+
 
         self._reset_parameters()
 
@@ -395,21 +650,50 @@ class HybridEncoder(nn.Module):
     def forward(self, feats):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+        key_proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
 
         # encoder
         if self.num_encoder_layers > 0:
             for i, enc_ind in enumerate(self.use_encoder_idx):
-                h, w = proj_feats[enc_ind].shape[2:]
+                B, C, h, w  = proj_feats[enc_ind].shape
+                B, C_k, h_k, w_k  = key_proj_feats[enc_ind].shape
+                x_f = torch.cat([proj_feats[enc_ind], key_proj_feats[enc_ind]], dim=1)
+                x_f = self.dwconv1(x_f)
+                x_f = self.norm1(x_f)
+                proj_feats[enc_ind], key_proj_feats[enc_ind] = torch.split(x_f, split_size_or_sections=[C, C_k], dim=1)
+
+
                 # flatten [B, C, H, W] to [B, HxW, C]
                 src_flatten = proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
+                key_src_flatten = key_proj_feats[enc_ind].flatten(2).permute(0, 2, 1)
                 if self.training or self.eval_spatial_size is None:
                     pos_embed = self.build_2d_sincos_position_embedding(
                         w, h, self.hidden_dim, self.pe_temperature).to(src_flatten.device)
+                    key_pos_embed = self.build_2d_sincos_position_embedding(
+                        w, h, self.hidden_dim, self.pe_temperature).to(key_src_flatten.device)
                 else:
                     pos_embed = getattr(self, f'pos_embed{enc_ind}', None).to(src_flatten.device)
+                    key_pos_embed = getattr(self, f'pos_embed{enc_ind}', None).to(key_src_flatten.device)
 
                 memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
+
+                key_memory :torch.Tensor = self.keypoint_encoder[i](key_src_flatten, pos_embed=key_pos_embed)
+                key_proj_feats[enc_ind] = key_memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
+
+                face_feats_i = memory                     # [B, H*W, C]
+                keypoint_feats_i = key_memory            # [B, H*W, C]
+
+                face_feats_i, keypoint_feats_i = self.cross_feature_attention(
+                    face_feats=face_feats_i,
+                    kpt_feats=keypoint_feats_i,
+                    pos_face=pos_embed,
+                    pos_kpt=key_pos_embed
+                )
+
+                # 更新两者
+                proj_feats[enc_ind] = face_feats_i.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
+                key_proj_feats[enc_ind] = keypoint_feats_i.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
 
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]
@@ -430,4 +714,24 @@ class HybridEncoder(nn.Module):
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_height], dim=1))
             outs.append(out)
 
-        return outs
+
+        #keypoint broadcasting and fusion
+        key_inner_outs = [key_proj_feats[-1]]
+        for idx in range(len(self.in_channels) - 1, 0, -1):
+            key_feat_heigh = key_inner_outs[0]
+            key_feat_low = key_proj_feats[idx - 1]
+            key_feat_heigh = self.key_lateral_convs[len(self.in_channels) - 1 - idx](key_feat_heigh)
+            key_inner_outs[0] = key_feat_heigh
+            key_upsample_feat = F.interpolate(key_feat_heigh, scale_factor=2., mode='nearest')
+            key_inner_out = self.key_fpn_blocks[len(self.in_channels)-1-idx](torch.concat([key_upsample_feat, key_feat_low], dim=1))
+            key_inner_outs.insert(0, key_inner_out)
+
+        key_outs = [key_inner_outs[0]]
+        for idx in range(len(self.in_channels) - 1):
+            key_feat_low = key_outs[-1]
+            key_feat_height = key_inner_outs[idx + 1]
+            key_downsample_feat = self.key_downsample_convs[idx](key_feat_low)
+            key_out = self.key_pan_blocks[idx](torch.concat([key_downsample_feat, key_feat_height], dim=1))
+            key_outs.append(key_out)
+
+        return outs,key_outs
